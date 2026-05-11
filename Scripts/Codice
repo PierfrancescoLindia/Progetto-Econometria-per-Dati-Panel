@@ -1,0 +1,1419 @@
+# ============================================================
+# PROGETTO ECONOMETRIA PER DATI PANEL
+# Script completo per analisi descrittiva, modelli panel,
+# robustezze e modello dinamico Arellano-Bond
+# ============================================================
+
+
+# ============================================================
+# 0. PACCHETTI
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(knitr)
+library(plm)
+library(lmtest)
+library(sandwich)
+
+
+# ============================================================
+# 1. CARTELLA OUTPUT
+# ============================================================
+
+if (!dir.exists("output")) {
+  dir.create("output")
+}
+
+
+# ============================================================
+# 2. PREPARAZIONE DATASET
+# ============================================================
+# Nota:
+# Si assume che il dataset sia già caricato in R con nome df.
+# Se devi importarlo da CSV, usa una riga del tipo:
+#
+# df <- read_csv("nome_file.csv")
+#
+# Il dataset deve contenere almeno le seguenti variabili:
+# company_id, company, year,
+# book_lev_debt_ratio, mkt_debt_ratio,
+# profitability_ratio, size_ln_total_assets,
+# tangible_ratio_fixed_asset_ratio, effective_tax_rate,
+# liquidity_ratio, asset_turn_over,
+# cashflow_from_operations,
+# rule_of_law, financial_sector_rating,
+# institutional_quality, macroeconomic_mgt,
+# accountability_and_corruption, profit_tax
+
+
+# ============================================================
+# 3. CONTROLLO STRUTTURA PANEL
+# ============================================================
+
+panel_structure <- df %>%
+  summarise(
+    n_observations = n(),
+    n_firms = n_distinct(company_id),
+    min_year = min(year, na.rm = TRUE),
+    max_year = max(year, na.rm = TRUE)
+  )
+
+panel_structure
+
+write_csv(panel_structure, "output/panel_structure.csv")
+
+
+# ------------------------------------------------------------
+# 3.1 Controllo duplicati impresa-anno
+# ------------------------------------------------------------
+
+duplicates_company_year <- df %>%
+  count(company_id, year) %>%
+  filter(n > 1)
+
+duplicates_company_year
+
+write_csv(duplicates_company_year, "output/duplicates_company_year.csv")
+
+
+# ------------------------------------------------------------
+# 3.2 Numero di osservazioni per impresa
+# ------------------------------------------------------------
+
+obs_per_firm <- df %>%
+  group_by(company_id, company) %>%
+  summarise(
+    n_years = n_distinct(year),
+    min_year = min(year, na.rm = TRUE),
+    max_year = max(year, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(n_years)
+
+obs_per_firm
+
+write_csv(obs_per_firm, "output/obs_per_firm.csv")
+
+
+distribution_obs_per_firm <- obs_per_firm %>%
+  count(n_years, name = "n_firms") %>%
+  arrange(n_years)
+
+distribution_obs_per_firm
+
+write_csv(distribution_obs_per_firm, "output/distribution_obs_per_firm.csv")
+
+
+# ------------------------------------------------------------
+# 3.3 Numero di imprese osservate per anno
+# ------------------------------------------------------------
+
+obs_per_year <- df %>%
+  group_by(year) %>%
+  summarise(
+    n_observations = n(),
+    n_firms = n_distinct(company_id),
+    .groups = "drop"
+  ) %>%
+  arrange(year)
+
+obs_per_year
+
+write_csv(obs_per_year, "output/obs_per_year.csv")
+
+
+fig_firms_year <- ggplot(obs_per_year, aes(x = year, y = n_firms)) +
+  geom_col() +
+  labs(
+    title = "Numero di imprese osservate per anno",
+    x = "Anno",
+    y = "Numero di imprese"
+  ) +
+  theme_minimal()
+
+fig_firms_year
+
+ggsave(
+  filename = "output/numero_imprese_per_anno.png",
+  plot = fig_firms_year,
+  width = 8,
+  height = 5
+)
+
+
+# ------------------------------------------------------------
+# 3.4 Creazione panel data frame
+# ------------------------------------------------------------
+
+pdata <- pdata.frame(df, index = c("company_id", "year"))
+
+pdim(pdata)
+is.pbalanced(pdata)
+
+
+# ============================================================
+# 4. ANALISI DEI VALORI MANCANTI
+# ============================================================
+
+missing_table <- df %>%
+  summarise(across(
+    everything(),
+    ~ sum(is.na(.))
+  )) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "missing"
+  ) %>%
+  mutate(
+    perc_missing = round(100 * missing / nrow(df), 2)
+  ) %>%
+  filter(missing > 0) %>%
+  arrange(desc(missing))
+
+missing_table
+
+write_csv(missing_table, "output/missing_values.csv")
+
+
+# ============================================================
+# 5. DISTRIBUZIONE LEVERAGE CONTABILE E DI MERCATO
+# ============================================================
+
+fig_leverage_distribution <- df %>%
+  select(book_lev_debt_ratio, mkt_debt_ratio) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 40) +
+  coord_cartesian(xlim = c(-1, 3)) +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(
+    title = "Distribuzione del leverage contabile e di mercato",
+    subtitle = "Scala limitata per migliorare la leggibilità grafica",
+    x = "Valore",
+    y = "Frequenza"
+  ) +
+  theme_minimal()
+
+fig_leverage_distribution
+
+ggsave(
+  filename = "output/distribuzione_leverage_contabile_mercato.png",
+  plot = fig_leverage_distribution,
+  width = 10,
+  height = 5
+)
+
+
+# ============================================================
+# 6. STATISTICHE DESCRITTIVE E VALORI ESTREMI
+# ============================================================
+
+vars_descr <- df %>%
+  select(
+    company_id,
+    company,
+    year,
+    book_lev_debt_ratio,
+    mkt_debt_ratio,
+    profitability_ratio,
+    size_ln_total_assets,
+    tangible_ratio_fixed_asset_ratio,
+    effective_tax_rate,
+    liquidity_ratio,
+    asset_turn_over,
+    cashflow_from_operations,
+    rule_of_law,
+    financial_sector_rating,
+    institutional_quality,
+    macroeconomic_mgt,
+    accountability_and_corruption,
+    profit_tax
+  )
+
+numeric_vars <- vars_descr %>%
+  select(-company_id, -company, -year)
+
+
+# ------------------------------------------------------------
+# 6.1 Tabella statistiche descrittive
+# ------------------------------------------------------------
+
+desc_table <- numeric_vars %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(variable) %>%
+  summarise(
+    n = sum(!is.na(value)),
+    missing = sum(is.na(value)),
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    min = min(value, na.rm = TRUE),
+    q1 = quantile(value, 0.25, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    q3 = quantile(value, 0.75, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    across(where(is.numeric), ~ round(., 4))
+  )
+
+desc_table
+
+kable(desc_table, caption = "Statistiche descrittive delle principali variabili")
+
+write_csv(desc_table, "output/statistiche_descrittive_principali.csv")
+
+
+# ------------------------------------------------------------
+# 6.2 Controllo outlier con regola IQR
+# ------------------------------------------------------------
+
+outlier_table <- numeric_vars %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(variable) %>%
+  summarise(
+    q1 = quantile(value, 0.25, na.rm = TRUE),
+    q3 = quantile(value, 0.75, na.rm = TRUE),
+    iqr = IQR(value, na.rm = TRUE),
+    lower_bound = q1 - 1.5 * iqr,
+    upper_bound = q3 + 1.5 * iqr,
+    n_outliers = sum(value < lower_bound | value > upper_bound, na.rm = TRUE),
+    perc_outliers = round(100 * n_outliers / sum(!is.na(value)), 2),
+    min = min(value, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    across(where(is.numeric), ~ round(., 4))
+  ) %>%
+  arrange(desc(n_outliers))
+
+outlier_table
+
+kable(outlier_table, caption = "Controllo dei valori estremi con regola IQR")
+
+write_csv(outlier_table, "output/outlier_table_iqr.csv")
+
+
+# ------------------------------------------------------------
+# 6.3 Osservazioni estreme principali
+# ------------------------------------------------------------
+
+top_booklev <- df %>%
+  select(
+    company_id,
+    company,
+    year,
+    book_lev_debt_ratio,
+    mkt_debt_ratio,
+    profitability_ratio,
+    size_ln_total_assets,
+    tangible_ratio_fixed_asset_ratio,
+    effective_tax_rate,
+    liquidity_ratio,
+    asset_turn_over
+  ) %>%
+  arrange(desc(book_lev_debt_ratio)) %>%
+  slice(1:15)
+
+bottom_booklev <- df %>%
+  select(
+    company_id,
+    company,
+    year,
+    book_lev_debt_ratio,
+    mkt_debt_ratio,
+    profitability_ratio,
+    size_ln_total_assets,
+    tangible_ratio_fixed_asset_ratio,
+    effective_tax_rate,
+    liquidity_ratio,
+    asset_turn_over
+  ) %>%
+  arrange(book_lev_debt_ratio) %>%
+  slice(1:15)
+
+top_liquidity <- df %>%
+  select(
+    company_id,
+    company,
+    year,
+    liquidity_ratio,
+    book_lev_debt_ratio,
+    mkt_debt_ratio,
+    size_ln_total_assets,
+    profitability_ratio
+  ) %>%
+  arrange(desc(liquidity_ratio)) %>%
+  slice(1:15)
+
+bottom_tax_rate <- df %>%
+  select(
+    company_id,
+    company,
+    year,
+    effective_tax_rate,
+    profit_before_tax,
+    net_income,
+    book_lev_debt_ratio,
+    mkt_debt_ratio
+  ) %>%
+  arrange(effective_tax_rate) %>%
+  slice(1:15)
+
+top_tangibility <- df %>%
+  select(
+    company_id,
+    company,
+    year,
+    tangible_ratio_fixed_asset_ratio,
+    book_lev_debt_ratio,
+    mkt_debt_ratio,
+    total_assets,
+    ppe
+  ) %>%
+  arrange(desc(tangible_ratio_fixed_asset_ratio)) %>%
+  slice(1:15)
+
+top_asset_turnover <- df %>%
+  select(
+    company_id,
+    company,
+    year,
+    asset_turn_over,
+    book_lev_debt_ratio,
+    mkt_debt_ratio,
+    revenue,
+    total_assets
+  ) %>%
+  arrange(desc(asset_turn_over)) %>%
+  slice(1:15)
+
+write_csv(top_booklev, "output/top_booklev.csv")
+write_csv(bottom_booklev, "output/bottom_booklev.csv")
+write_csv(top_liquidity, "output/top_liquidity.csv")
+write_csv(bottom_tax_rate, "output/bottom_tax_rate.csv")
+write_csv(top_tangibility, "output/top_tangibility.csv")
+write_csv(top_asset_turnover, "output/top_asset_turnover.csv")
+
+
+# ------------------------------------------------------------
+# 6.4 Boxplot variabili problematiche standardizzate
+# ------------------------------------------------------------
+
+problem_vars <- df %>%
+  select(
+    book_lev_debt_ratio,
+    profitability_ratio,
+    tangible_ratio_fixed_asset_ratio,
+    effective_tax_rate,
+    liquidity_ratio,
+    asset_turn_over
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(variable) %>%
+  mutate(
+    value_standardized = as.numeric(scale(value))
+  ) %>%
+  ungroup()
+
+fig_outlier_boxplot <- ggplot(problem_vars, aes(x = variable, y = value_standardized)) +
+  geom_boxplot() +
+  coord_cartesian(ylim = c(-5, 10)) +
+  labs(
+    title = "Distribuzione standardizzata delle variabili con valori estremi",
+    subtitle = "Scala limitata per migliorare la leggibilità grafica",
+    x = "Variabile",
+    y = "Valore standardizzato"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+fig_outlier_boxplot
+
+ggsave(
+  filename = "output/boxplot_variabili_outlier_standardizzate.png",
+  plot = fig_outlier_boxplot,
+  width = 10,
+  height = 5
+)
+
+
+# ------------------------------------------------------------
+# 6.5 Istogrammi limitati variabili problematiche
+# ------------------------------------------------------------
+
+plot_limited_hist <- function(data, var, x_min, x_max, file_name, title_text) {
+  p <- ggplot(data, aes(x = .data[[var]])) +
+    geom_histogram(bins = 40) +
+    coord_cartesian(xlim = c(x_min, x_max)) +
+    labs(
+      title = title_text,
+      subtitle = "Scala limitata per migliorare la leggibilità grafica",
+      x = var,
+      y = "Frequenza"
+    ) +
+    theme_minimal()
+  
+  print(p)
+  
+  ggsave(
+    filename = paste0("output/", file_name),
+    plot = p,
+    width = 8,
+    height = 5
+  )
+}
+
+plot_limited_hist(
+  df,
+  "book_lev_debt_ratio",
+  -1,
+  3,
+  "hist_book_leverage_limitato.png",
+  "Distribuzione del leverage contabile"
+)
+
+plot_limited_hist(
+  df,
+  "liquidity_ratio",
+  0,
+  10,
+  "hist_liquidity_ratio_limitato.png",
+  "Distribuzione del liquidity ratio"
+)
+
+plot_limited_hist(
+  df,
+  "effective_tax_rate",
+  -1,
+  2,
+  "hist_effective_tax_rate_limitato.png",
+  "Distribuzione dell'effective tax rate"
+)
+
+plot_limited_hist(
+  df,
+  "tangible_ratio_fixed_asset_ratio",
+  0,
+  2,
+  "hist_tangibility_ratio_limitato.png",
+  "Distribuzione del tangible ratio"
+)
+
+plot_limited_hist(
+  df,
+  "asset_turn_over",
+  0,
+  10,
+  "hist_asset_turnover_limitato.png",
+  "Distribuzione dell'asset turnover"
+)
+
+
+# ============================================================
+# 7. SPECIFICAZIONE BASE DEI MODELLI STATICI
+# ============================================================
+
+formula_base <- book_lev_debt_ratio ~
+  profitability_ratio +
+  size_ln_total_assets +
+  tangible_ratio_fixed_asset_ratio +
+  effective_tax_rate +
+  liquidity_ratio +
+  asset_turn_over +
+  rule_of_law +
+  financial_sector_rating +
+  institutional_quality +
+  macroeconomic_mgt +
+  accountability_and_corruption
+
+
+# ============================================================
+# 8. MODELLO POOLED OLS
+# ============================================================
+
+pooled_ols <- plm(
+  formula_base,
+  data = pdata,
+  model = "pooling"
+)
+
+summary(pooled_ols)
+
+pooled_ols_robust <- coeftest(
+  pooled_ols,
+  vcov = vcovHC(
+    pooled_ols,
+    type = "HC1",
+    cluster = "group"
+  )
+)
+
+pooled_ols_robust
+
+n_obs_pooled <- nobs(pooled_ols)
+r2_pooled <- summary(pooled_ols)$r.squared["rsq"]
+adj_r2_pooled <- summary(pooled_ols)$r.squared["adjrsq"]
+
+cat("\n================ POOLED OLS ================\n")
+cat("Numero osservazioni utilizzate:", n_obs_pooled, "\n")
+cat("R-squared:", round(r2_pooled, 4), "\n")
+cat("Adjusted R-squared:", round(adj_r2_pooled, 4), "\n")
+cat("============================================\n")
+
+pooled_results <- data.frame(
+  variable = rownames(pooled_ols_robust),
+  estimate = pooled_ols_robust[, 1],
+  robust_se = pooled_ols_robust[, 2],
+  t_value = pooled_ols_robust[, 3],
+  p_value = pooled_ols_robust[, 4]
+) %>%
+  mutate(
+    estimate = round(estimate, 5),
+    robust_se = round(robust_se, 5),
+    t_value = round(t_value, 4),
+    p_value = round(p_value, 5)
+  )
+
+pooled_results
+
+write_csv(pooled_results, "output/pooled_ols_results.csv")
+
+
+# ============================================================
+# 9. MODELLO A EFFETTI FISSI
+# ============================================================
+
+fixed_effects <- plm(
+  formula_base,
+  data = pdata,
+  model = "within",
+  effect = "individual"
+)
+
+summary(fixed_effects)
+
+fixed_effects_robust <- coeftest(
+  fixed_effects,
+  vcov = vcovHC(
+    fixed_effects,
+    type = "HC1",
+    cluster = "group"
+  )
+)
+
+fixed_effects_robust
+
+n_obs_fe <- nobs(fixed_effects)
+r2_fe <- summary(fixed_effects)$r.squared["rsq"]
+adj_r2_fe <- summary(fixed_effects)$r.squared["adjrsq"]
+
+cat("\n================ FIXED EFFECTS ================\n")
+cat("Numero osservazioni utilizzate:", n_obs_fe, "\n")
+cat("R-squared within:", round(r2_fe, 4), "\n")
+cat("Adjusted R-squared:", round(adj_r2_fe, 4), "\n")
+cat("===============================================\n")
+
+f_test_fe_vs_pooled <- pFtest(fixed_effects, pooled_ols)
+
+f_test_fe_vs_pooled
+
+fe_results <- data.frame(
+  variable = rownames(fixed_effects_robust),
+  estimate = fixed_effects_robust[, 1],
+  robust_se = fixed_effects_robust[, 2],
+  t_value = fixed_effects_robust[, 3],
+  p_value = fixed_effects_robust[, 4]
+) %>%
+  mutate(
+    estimate = round(estimate, 5),
+    robust_se = round(robust_se, 5),
+    t_value = round(t_value, 4),
+    p_value = round(p_value, 5)
+  )
+
+fe_results
+
+write_csv(fe_results, "output/fixed_effects_results.csv")
+
+
+# ============================================================
+# 10. MODELLO A EFFETTI CASUALI
+# ============================================================
+
+random_effects <- plm(
+  formula_base,
+  data = pdata,
+  model = "random",
+  effect = "individual"
+)
+
+summary(random_effects)
+
+random_effects_robust <- coeftest(
+  random_effects,
+  vcov = vcovHC(
+    random_effects,
+    type = "HC1",
+    cluster = "group"
+  )
+)
+
+random_effects_robust
+
+n_obs_re <- nobs(random_effects)
+r2_re <- summary(random_effects)$r.squared["rsq"]
+adj_r2_re <- summary(random_effects)$r.squared["adjrsq"]
+
+cat("\n================ RANDOM EFFECTS ================\n")
+cat("Numero osservazioni utilizzate:", n_obs_re, "\n")
+cat("R-squared:", round(r2_re, 4), "\n")
+cat("Adjusted R-squared:", round(adj_r2_re, 4), "\n")
+cat("================================================\n")
+
+bp_test_re_vs_pooled <- plmtest(
+  pooled_ols,
+  type = "bp"
+)
+
+bp_test_re_vs_pooled
+
+hausman_test <- phtest(
+  fixed_effects,
+  random_effects
+)
+
+hausman_test
+
+re_results <- data.frame(
+  variable = rownames(random_effects_robust),
+  estimate = random_effects_robust[, 1],
+  robust_se = random_effects_robust[, 2],
+  t_value = random_effects_robust[, 3],
+  p_value = random_effects_robust[, 4]
+) %>%
+  mutate(
+    estimate = round(estimate, 5),
+    robust_se = round(robust_se, 5),
+    t_value = round(t_value, 4),
+    p_value = round(p_value, 5)
+  )
+
+re_results
+
+write_csv(re_results, "output/random_effects_results.csv")
+
+
+# ============================================================
+# 11. CONFRONTO MODELLI STATICI PANEL
+# ============================================================
+
+pooled_robust <- coeftest(
+  pooled_ols,
+  vcov = vcovHC(pooled_ols, type = "HC1", cluster = "group")
+)
+
+fe_robust <- coeftest(
+  fixed_effects,
+  vcov = vcovHC(fixed_effects, type = "HC1", cluster = "group")
+)
+
+re_robust <- coeftest(
+  random_effects,
+  vcov = vcovHC(random_effects, type = "HC1", cluster = "group")
+)
+
+
+format_model <- function(model_output, model_name) {
+  data.frame(
+    variable = rownames(model_output),
+    estimate = model_output[, 1],
+    robust_se = model_output[, 2],
+    p_value = model_output[, 4]
+  ) %>%
+    mutate(
+      stars = case_when(
+        p_value < 0.01 ~ "***",
+        p_value < 0.05 ~ "**",
+        p_value < 0.10 ~ "*",
+        TRUE ~ ""
+      ),
+      result = paste0(
+        round(estimate, 4),
+        stars,
+        "\n(",
+        round(robust_se, 4),
+        ")"
+      )
+    ) %>%
+    select(variable, !!model_name := result)
+}
+
+pooled_table <- format_model(pooled_robust, "Pooled_OLS")
+fe_table <- format_model(fe_robust, "Fixed_Effects")
+re_table <- format_model(re_robust, "Random_Effects")
+
+comparison_table <- pooled_table %>%
+  full_join(fe_table, by = "variable") %>%
+  full_join(re_table, by = "variable")
+
+comparison_table
+
+model_stats <- data.frame(
+  statistic = c(
+    "Observations",
+    "R-squared",
+    "Adjusted R-squared"
+  ),
+  Pooled_OLS = c(
+    nobs(pooled_ols),
+    round(summary(pooled_ols)$r.squared["rsq"], 4),
+    round(summary(pooled_ols)$r.squared["adjrsq"], 4)
+  ),
+  Fixed_Effects = c(
+    nobs(fixed_effects),
+    round(summary(fixed_effects)$r.squared["rsq"], 4),
+    round(summary(fixed_effects)$r.squared["adjrsq"], 4)
+  ),
+  Random_Effects = c(
+    nobs(random_effects),
+    round(summary(random_effects)$r.squared["rsq"], 4),
+    round(summary(random_effects)$r.squared["adjrsq"], 4)
+  )
+)
+
+model_stats
+
+test_results <- data.frame(
+  test = c(
+    "F test: Fixed Effects vs Pooled OLS",
+    "Breusch-Pagan LM: Random Effects vs Pooled OLS",
+    "Hausman test: Fixed Effects vs Random Effects"
+  ),
+  statistic = c(
+    round(as.numeric(f_test_fe_vs_pooled$statistic), 4),
+    round(as.numeric(bp_test_re_vs_pooled$statistic), 4),
+    round(as.numeric(hausman_test$statistic), 4)
+  ),
+  p_value = c(
+    f_test_fe_vs_pooled$p.value,
+    bp_test_re_vs_pooled$p.value,
+    hausman_test$p.value
+  )
+) %>%
+  mutate(
+    p_value = ifelse(p_value < 0.001, "<0.001", round(p_value, 4))
+  )
+
+test_results
+
+write_csv(comparison_table, "output/comparison_static_models.csv")
+write_csv(model_stats, "output/model_stats_static_models.csv")
+write_csv(test_results, "output/test_results_static_models.csv")
+
+
+# ============================================================
+# 12. ANALISI DI ROBUSTEZZA 1
+# RANDOM EFFECTS CON VARIABILI WINSORIZZATE
+# ============================================================
+
+winsorize <- function(x, probs = c(0.01, 0.99)) {
+  q <- quantile(x, probs = probs, na.rm = TRUE)
+  x_w <- pmin(pmax(x, q[1]), q[2])
+  return(x_w)
+}
+
+df_winsor <- df %>%
+  mutate(
+    book_lev_debt_ratio_w = winsorize(book_lev_debt_ratio),
+    profitability_ratio_w = winsorize(profitability_ratio),
+    tangible_ratio_fixed_asset_ratio_w = winsorize(tangible_ratio_fixed_asset_ratio),
+    effective_tax_rate_w = winsorize(effective_tax_rate),
+    liquidity_ratio_w = winsorize(liquidity_ratio),
+    asset_turn_over_w = winsorize(asset_turn_over)
+  )
+
+winsor_compare <- df_winsor %>%
+  select(
+    book_lev_debt_ratio,
+    book_lev_debt_ratio_w,
+    profitability_ratio,
+    profitability_ratio_w,
+    tangible_ratio_fixed_asset_ratio,
+    tangible_ratio_fixed_asset_ratio_w,
+    effective_tax_rate,
+    effective_tax_rate_w,
+    liquidity_ratio,
+    liquidity_ratio_w,
+    asset_turn_over,
+    asset_turn_over_w
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(variable) %>%
+  summarise(
+    n = sum(!is.na(value)),
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    min = min(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(., 4)))
+
+winsor_compare
+
+pdata_winsor <- pdata.frame(
+  df_winsor,
+  index = c("company_id", "year")
+)
+
+formula_re_winsor <- book_lev_debt_ratio_w ~
+  profitability_ratio_w +
+  size_ln_total_assets +
+  tangible_ratio_fixed_asset_ratio_w +
+  effective_tax_rate_w +
+  liquidity_ratio_w +
+  asset_turn_over_w +
+  rule_of_law +
+  financial_sector_rating +
+  institutional_quality +
+  macroeconomic_mgt +
+  accountability_and_corruption
+
+random_effects_winsor <- plm(
+  formula_re_winsor,
+  data = pdata_winsor,
+  model = "random",
+  effect = "individual"
+)
+
+summary(random_effects_winsor)
+
+random_effects_winsor_robust <- coeftest(
+  random_effects_winsor,
+  vcov = vcovHC(
+    random_effects_winsor,
+    type = "HC1",
+    cluster = "group"
+  )
+)
+
+random_effects_winsor_robust
+
+n_obs_re_winsor <- nobs(random_effects_winsor)
+r2_re_winsor <- summary(random_effects_winsor)$r.squared["rsq"]
+adj_r2_re_winsor <- summary(random_effects_winsor)$r.squared["adjrsq"]
+
+cat("\n================ RANDOM EFFECTS WINSORIZZATO ================\n")
+cat("Numero osservazioni utilizzate:", n_obs_re_winsor, "\n")
+cat("R-squared:", round(r2_re_winsor, 4), "\n")
+cat("Adjusted R-squared:", round(adj_r2_re_winsor, 4), "\n")
+cat("=============================================================\n")
+
+re_winsor_results <- data.frame(
+  variable = rownames(random_effects_winsor_robust),
+  estimate = random_effects_winsor_robust[, 1],
+  robust_se = random_effects_winsor_robust[, 2],
+  t_value = random_effects_winsor_robust[, 3],
+  p_value = random_effects_winsor_robust[, 4]
+) %>%
+  mutate(
+    estimate = round(estimate, 5),
+    robust_se = round(robust_se, 5),
+    t_value = round(t_value, 4),
+    p_value = round(p_value, 5)
+  )
+
+re_winsor_results
+
+re_original_table <- format_model(
+  random_effects_robust,
+  "Random_Effects_originale"
+)
+
+re_winsor_table <- format_model(
+  random_effects_winsor_robust,
+  "Random_Effects_winsorizzato"
+)
+
+comparison_re_winsor <- re_original_table %>%
+  full_join(re_winsor_table, by = "variable")
+
+comparison_re_winsor
+
+write_csv(df_winsor, "output/dataset_winsorizzato.csv")
+write_csv(winsor_compare, "output/confronto_descrittivo_winsor.csv")
+write_csv(re_winsor_results, "output/random_effects_winsor_results.csv")
+write_csv(comparison_re_winsor, "output/confronto_re_originale_winsor.csv")
+
+
+# ============================================================
+# 13. ANALISI DI ROBUSTEZZA 2
+# RANDOM EFFECTS ESCLUDENDO L'ANNO 2019
+# ============================================================
+
+df_no2019 <- df %>%
+  filter(year <= 2018)
+
+cat("\n================ CAMPIONE 2008-2018 ================\n")
+cat("Osservazioni totali:", nrow(df_no2019), "\n")
+cat("Numero imprese:", n_distinct(df_no2019$company_id), "\n")
+cat("Periodo:", min(df_no2019$year), "-", max(df_no2019$year), "\n")
+cat("====================================================\n")
+
+obs_per_year_no2019 <- df_no2019 %>%
+  group_by(year) %>%
+  summarise(
+    n_observations = n(),
+    n_firms = n_distinct(company_id),
+    .groups = "drop"
+  )
+
+obs_per_year_no2019
+
+pdata_no2019 <- pdata.frame(
+  df_no2019,
+  index = c("company_id", "year")
+)
+
+pdim(pdata_no2019)
+is.pbalanced(pdata_no2019)
+
+random_effects_no2019 <- plm(
+  formula_base,
+  data = pdata_no2019,
+  model = "random",
+  effect = "individual"
+)
+
+summary(random_effects_no2019)
+
+random_effects_no2019_robust <- coeftest(
+  random_effects_no2019,
+  vcov = vcovHC(
+    random_effects_no2019,
+    type = "HC1",
+    cluster = "group"
+  )
+)
+
+random_effects_no2019_robust
+
+n_obs_re_no2019 <- nobs(random_effects_no2019)
+r2_re_no2019 <- summary(random_effects_no2019)$r.squared["rsq"]
+adj_r2_re_no2019 <- summary(random_effects_no2019)$r.squared["adjrsq"]
+
+cat("\n================ RANDOM EFFECTS 2008-2018 ================\n")
+cat("Numero osservazioni utilizzate:", n_obs_re_no2019, "\n")
+cat("R-squared:", round(r2_re_no2019, 4), "\n")
+cat("Adjusted R-squared:", round(adj_r2_re_no2019, 4), "\n")
+cat("==========================================================\n")
+
+re_no2019_results <- data.frame(
+  variable = rownames(random_effects_no2019_robust),
+  estimate = random_effects_no2019_robust[, 1],
+  robust_se = random_effects_no2019_robust[, 2],
+  t_value = random_effects_no2019_robust[, 3],
+  p_value = random_effects_no2019_robust[, 4]
+) %>%
+  mutate(
+    estimate = round(estimate, 5),
+    robust_se = round(robust_se, 5),
+    t_value = round(t_value, 4),
+    p_value = round(p_value, 5)
+  )
+
+re_no2019_results
+
+re_full_table <- format_model(
+  random_effects_robust,
+  "Random_Effects_2008_2019"
+)
+
+re_no2019_table <- format_model(
+  random_effects_no2019_robust,
+  "Random_Effects_2008_2018"
+)
+
+comparison_re_no2019 <- re_full_table %>%
+  full_join(re_no2019_table, by = "variable")
+
+comparison_re_no2019
+
+comparison_stats_no2019 <- data.frame(
+  statistic = c(
+    "Observations",
+    "R-squared",
+    "Adjusted R-squared"
+  ),
+  Random_Effects_2008_2019 = c(
+    nobs(random_effects),
+    round(summary(random_effects)$r.squared["rsq"], 4),
+    round(summary(random_effects)$r.squared["adjrsq"], 4)
+  ),
+  Random_Effects_2008_2018 = c(
+    n_obs_re_no2019,
+    round(r2_re_no2019, 4),
+    round(adj_r2_re_no2019, 4)
+  )
+)
+
+comparison_stats_no2019
+
+write_csv(df_no2019, "output/dataset_senza_2019.csv")
+write_csv(obs_per_year_no2019, "output/obs_per_year_senza_2019.csv")
+write_csv(re_no2019_results, "output/random_effects_no2019_results.csv")
+write_csv(comparison_re_no2019, "output/confronto_re_completo_senza_2019.csv")
+write_csv(comparison_stats_no2019, "output/confronto_stats_re_senza_2019.csv")
+
+
+# ============================================================
+# 14. ANALISI DI ROBUSTEZZA 3
+# RANDOM EFFECTS CON INCLUSIONE DI PROFIT TAX
+# ============================================================
+
+missing_profit_tax <- df %>%
+  summarise(
+    n_total = n(),
+    missing_profit_tax = sum(is.na(profit_tax)),
+    perc_missing_profit_tax = round(100 * missing_profit_tax / n_total, 2)
+  )
+
+missing_profit_tax
+
+df_profit_tax <- df %>%
+  select(
+    company_id,
+    company,
+    year,
+    book_lev_debt_ratio,
+    profitability_ratio,
+    size_ln_total_assets,
+    tangible_ratio_fixed_asset_ratio,
+    effective_tax_rate,
+    liquidity_ratio,
+    asset_turn_over,
+    rule_of_law,
+    financial_sector_rating,
+    institutional_quality,
+    macroeconomic_mgt,
+    accountability_and_corruption,
+    profit_tax
+  ) %>%
+  drop_na()
+
+cat("\n================ CAMPIONE CON PROFIT TAX ================\n")
+cat("Osservazioni totali:", nrow(df_profit_tax), "\n")
+cat("Numero imprese:", n_distinct(df_profit_tax$company_id), "\n")
+cat("Periodo:", min(df_profit_tax$year), "-", max(df_profit_tax$year), "\n")
+cat("=========================================================\n")
+
+obs_per_year_profit_tax <- df_profit_tax %>%
+  group_by(year) %>%
+  summarise(
+    n_observations = n(),
+    n_firms = n_distinct(company_id),
+    .groups = "drop"
+  )
+
+obs_per_year_profit_tax
+
+pdata_profit_tax <- pdata.frame(
+  df_profit_tax,
+  index = c("company_id", "year")
+)
+
+pdim(pdata_profit_tax)
+is.pbalanced(pdata_profit_tax)
+
+formula_re_profit_tax <- book_lev_debt_ratio ~
+  profitability_ratio +
+  size_ln_total_assets +
+  tangible_ratio_fixed_asset_ratio +
+  effective_tax_rate +
+  liquidity_ratio +
+  asset_turn_over +
+  rule_of_law +
+  financial_sector_rating +
+  institutional_quality +
+  macroeconomic_mgt +
+  accountability_and_corruption +
+  profit_tax
+
+random_effects_profit_tax <- plm(
+  formula_re_profit_tax,
+  data = pdata_profit_tax,
+  model = "random",
+  effect = "individual"
+)
+
+summary(random_effects_profit_tax)
+
+random_effects_profit_tax_robust <- coeftest(
+  random_effects_profit_tax,
+  vcov = vcovHC(
+    random_effects_profit_tax,
+    type = "HC1",
+    cluster = "group"
+  )
+)
+
+random_effects_profit_tax_robust
+
+n_obs_re_profit_tax <- nobs(random_effects_profit_tax)
+r2_re_profit_tax <- summary(random_effects_profit_tax)$r.squared["rsq"]
+adj_r2_re_profit_tax <- summary(random_effects_profit_tax)$r.squared["adjrsq"]
+
+cat("\n================ RANDOM EFFECTS CON PROFIT TAX ================\n")
+cat("Numero osservazioni utilizzate:", n_obs_re_profit_tax, "\n")
+cat("R-squared:", round(r2_re_profit_tax, 4), "\n")
+cat("Adjusted R-squared:", round(adj_r2_re_profit_tax, 4), "\n")
+cat("================================================================\n")
+
+re_profit_tax_results <- data.frame(
+  variable = rownames(random_effects_profit_tax_robust),
+  estimate = random_effects_profit_tax_robust[, 1],
+  robust_se = random_effects_profit_tax_robust[, 2],
+  t_value = random_effects_profit_tax_robust[, 3],
+  p_value = random_effects_profit_tax_robust[, 4]
+) %>%
+  mutate(
+    estimate = round(estimate, 5),
+    robust_se = round(robust_se, 5),
+    t_value = round(t_value, 4),
+    p_value = round(p_value, 5)
+  )
+
+re_profit_tax_results
+
+re_base_table <- format_model(
+  random_effects_robust,
+  "Random_Effects_base"
+)
+
+re_profit_tax_table <- format_model(
+  random_effects_profit_tax_robust,
+  "Random_Effects_con_Profit_Tax"
+)
+
+comparison_re_profit_tax <- re_base_table %>%
+  full_join(re_profit_tax_table, by = "variable")
+
+comparison_re_profit_tax
+
+comparison_stats_profit_tax <- data.frame(
+  statistic = c(
+    "Observations",
+    "R-squared",
+    "Adjusted R-squared"
+  ),
+  Random_Effects_base = c(
+    nobs(random_effects),
+    round(summary(random_effects)$r.squared["rsq"], 4),
+    round(summary(random_effects)$r.squared["adjrsq"], 4)
+  ),
+  Random_Effects_con_Profit_Tax = c(
+    n_obs_re_profit_tax,
+    round(r2_re_profit_tax, 4),
+    round(adj_r2_re_profit_tax, 4)
+  )
+)
+
+comparison_stats_profit_tax
+
+write_csv(missing_profit_tax, "output/missing_profit_tax.csv")
+write_csv(df_profit_tax, "output/dataset_con_profit_tax_complete_cases.csv")
+write_csv(obs_per_year_profit_tax, "output/obs_per_year_profit_tax.csv")
+write_csv(re_profit_tax_results, "output/random_effects_profit_tax_results.csv")
+write_csv(comparison_re_profit_tax, "output/confronto_re_base_profit_tax.csv")
+write_csv(comparison_stats_profit_tax, "output/confronto_stats_re_profit_tax.csv")
+
+
+# ============================================================
+# 15. MODELLO PANEL DINAMICO
+# ARELLANO-BOND / DIFFERENCE GMM
+# ============================================================
+
+dynamic_ab <- pgmm(
+  book_lev_debt_ratio ~
+    lag(book_lev_debt_ratio, 1) +
+    profitability_ratio +
+    size_ln_total_assets +
+    tangible_ratio_fixed_asset_ratio +
+    effective_tax_rate +
+    liquidity_ratio +
+    asset_turn_over +
+    rule_of_law +
+    financial_sector_rating +
+    institutional_quality +
+    macroeconomic_mgt +
+    accountability_and_corruption |
+    lag(book_lev_debt_ratio, 2:3),
+  data = pdata,
+  effect = "individual",
+  model = "twosteps",
+  transformation = "d"
+)
+
+summary(dynamic_ab)
+
+summary_dynamic_ab <- summary(dynamic_ab, robust = TRUE)
+
+summary_dynamic_ab
+
+
+# ------------------------------------------------------------
+# 15.1 Test diagnostici Arellano-Bond
+# ------------------------------------------------------------
+
+ar1_test <- mtest(dynamic_ab, order = 1)
+ar2_test <- mtest(dynamic_ab, order = 2)
+sargan_test <- sargan(dynamic_ab)
+
+ar1_test
+ar2_test
+sargan_test
+
+
+# ------------------------------------------------------------
+# 15.2 Estrazione risultati modello dinamico
+# ------------------------------------------------------------
+
+dynamic_coefficients <- summary_dynamic_ab$coefficients
+
+dynamic_results <- data.frame(
+  variable = rownames(dynamic_coefficients),
+  estimate = dynamic_coefficients[, 1],
+  robust_se = dynamic_coefficients[, 2],
+  z_value = dynamic_coefficients[, 3],
+  p_value = dynamic_coefficients[, 4]
+) %>%
+  mutate(
+    estimate = round(estimate, 5),
+    robust_se = round(robust_se, 5),
+    z_value = round(z_value, 4),
+    p_value = round(p_value, 5)
+  )
+
+dynamic_results
+
+n_obs_dynamic <- nobs(dynamic_ab)
+
+cat("\n================ MODELLO DINAMICO ARELLANO-BOND ================\n")
+cat("Numero osservazioni utilizzate:", n_obs_dynamic, "\n")
+cat("===============================================================\n")
+
+
+diagnostic_tests_dynamic <- data.frame(
+  test = c(
+    "Arellano-Bond AR(1)",
+    "Arellano-Bond AR(2)",
+    "Sargan test"
+  ),
+  statistic = c(
+    as.numeric(ar1_test$statistic),
+    as.numeric(ar2_test$statistic),
+    as.numeric(sargan_test$statistic)
+  ),
+  p_value = c(
+    ar1_test$p.value,
+    ar2_test$p.value,
+    sargan_test$p.value
+  )
+) %>%
+  mutate(
+    statistic = round(statistic, 4),
+    p_value = ifelse(p_value < 0.001, "<0.001", as.character(round(p_value, 4)))
+  )
+
+diagnostic_tests_dynamic
+
+
+# ------------------------------------------------------------
+# 15.3 Confronto Random Effects statico vs Arellano-Bond
+# ------------------------------------------------------------
+
+re_static_table <- format_model(
+  random_effects_robust,
+  "Random_Effects_statico"
+)
+
+dynamic_table <- dynamic_results %>%
+  mutate(
+    stars = case_when(
+      p_value < 0.01 ~ "***",
+      p_value < 0.05 ~ "**",
+      p_value < 0.10 ~ "*",
+      TRUE ~ ""
+    ),
+    Dynamic_Arellano_Bond = paste0(
+      estimate,
+      stars,
+      "\n(",
+      robust_se,
+      ")"
+    )
+  ) %>%
+  select(variable, Dynamic_Arellano_Bond)
+
+comparison_static_dynamic <- re_static_table %>%
+  full_join(dynamic_table, by = "variable")
+
+comparison_static_dynamic
+
+write_csv(dynamic_results, "output/dynamic_arellano_bond_results.csv")
+write_csv(diagnostic_tests_dynamic, "output/dynamic_arellano_bond_tests.csv")
+write_csv(comparison_static_dynamic, "output/confronto_statico_dinamico.csv")
+
+
+# ============================================================
+# 16. RIEPILOGO FINALE OUTPUT
+# ============================================================
+
+cat("\n================ OUTPUT PRINCIPALI CREATI ================\n")
+cat("1. output/panel_structure.csv\n")
+cat("2. output/obs_per_firm.csv\n")
+cat("3. output/distribution_obs_per_firm.csv\n")
+cat("4. output/obs_per_year.csv\n")
+cat("5. output/missing_values.csv\n")
+cat("6. output/statistiche_descrittive_principali.csv\n")
+cat("7. output/outlier_table_iqr.csv\n")
+cat("8. output/pooled_ols_results.csv\n")
+cat("9. output/fixed_effects_results.csv\n")
+cat("10. output/random_effects_results.csv\n")
+cat("11. output/comparison_static_models.csv\n")
+cat("12. output/test_results_static_models.csv\n")
+cat("13. output/random_effects_winsor_results.csv\n")
+cat("14. output/random_effects_no2019_results.csv\n")
+cat("15. output/random_effects_profit_tax_results.csv\n")
+cat("16. output/dynamic_arellano_bond_results.csv\n")
+cat("17. output/dynamic_arellano_bond_tests.csv\n")
+cat("==========================================================\n")
